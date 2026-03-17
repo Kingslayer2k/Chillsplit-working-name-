@@ -127,6 +127,17 @@
       expenses,
       comments,
       pools,
+      sync: {
+        mode: "local", // local | supabase
+        supabaseUrl: "",
+        supabaseAnonKey: "",
+        groupId: null,
+        groupName: null,
+        joinCode: null,
+        memberId: null,
+        lastPullAt: 0,
+        autoSync: true,
+      },
       prefs: {
         meMemberId: members[0]?.id || null,
         roundUpToDollars: true,
@@ -146,6 +157,7 @@
         ...base,
         ...parsed,
         prefs: { ...base.prefs, ...(parsed.prefs || {}) },
+        sync: { ...base.sync, ...(parsed.sync || {}) },
         view: parsed.view || { kind: "tab" },
       };
     } catch {
@@ -159,6 +171,235 @@
 
   let state = loadState();
   const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---- Cloud Sync (Supabase) -------------------------------------------------
+  let supabaseClient = null;
+  let supabaseClientCacheKey = null;
+  let cloudPullInFlight = false;
+
+  function hasSupabaseConfig() {
+    return Boolean(state.sync.supabaseUrl && state.sync.supabaseAnonKey);
+  }
+
+  function isCloudEnabled() {
+    return state.sync.mode === "supabase" && hasSupabaseConfig() && Boolean(state.sync.groupId);
+  }
+
+  function isCloudReady() {
+    return isCloudEnabled() && Boolean(state.sync.memberId);
+  }
+
+  async function getSupabaseClient() {
+    const url = String(state.sync.supabaseUrl || "").trim();
+    const key = String(state.sync.supabaseAnonKey || "").trim();
+    if (!url || !key) throw new Error("Missing Supabase URL / anon key");
+    const cacheKey = `${url}::${key}`;
+    if (supabaseClient && supabaseClientCacheKey === cacheKey) return supabaseClient;
+    const mod = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
+    supabaseClient = mod.createClient(url, key, { auth: { persistSession: false } });
+    supabaseClientCacheKey = cacheKey;
+    return supabaseClient;
+  }
+
+  function randomJoinCode(len = 8) {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // avoids confusing chars
+    let out = "";
+    for (let i = 0; i < len; i++) out += alphabet[Math.floor(Math.random() * alphabet.length)];
+    return out;
+  }
+
+  async function cloudCreateGroup(groupName, myName, myEmoji) {
+    const sb = await getSupabaseClient();
+    const joinCode = randomJoinCode(8);
+    const groupRes = await sb
+      .from("cs_groups")
+      .insert({ name: groupName, join_code: joinCode })
+      .select("id,name,join_code")
+      .single();
+    if (groupRes.error) throw groupRes.error;
+
+    const groupId = groupRes.data.id;
+    const memberRes = await sb
+      .from("cs_members")
+      .insert({ group_id: groupId, name: myName, emoji: myEmoji })
+      .select("id")
+      .single();
+    if (memberRes.error) throw memberRes.error;
+
+    const contextsRes = await sb
+      .from("cs_contexts")
+      .insert({ group_id: groupId, type: "home", name: "Our Place", emoji: "🏠", closed: false })
+      .select("id");
+    if (contextsRes.error) throw contextsRes.error;
+
+    state.sync.mode = "supabase";
+    state.sync.groupId = groupId;
+    state.sync.groupName = groupRes.data.name;
+    state.sync.joinCode = groupRes.data.join_code;
+    state.sync.memberId = memberRes.data.id;
+    state.prefs.meMemberId = memberRes.data.id;
+    saveState();
+    await cloudPullNow({ toastOnSuccess: true });
+  }
+
+  async function cloudJoinGroup(joinCode, myName, myEmoji) {
+    const sb = await getSupabaseClient();
+    const groupRes = await sb
+      .from("cs_groups")
+      .select("id,name,join_code")
+      .eq("join_code", joinCode)
+      .maybeSingle();
+    if (groupRes.error) throw groupRes.error;
+    if (!groupRes.data) throw new Error("No group found for that code");
+
+    const groupId = groupRes.data.id;
+    const memberRes = await sb
+      .from("cs_members")
+      .insert({ group_id: groupId, name: myName, emoji: myEmoji })
+      .select("id")
+      .single();
+    if (memberRes.error) throw memberRes.error;
+
+    // Ensure there's at least a home context.
+    const ctxRes = await sb.from("cs_contexts").select("id").eq("group_id", groupId).eq("type", "home").limit(1);
+    if (ctxRes.error) throw ctxRes.error;
+    if (!ctxRes.data || ctxRes.data.length === 0) {
+      const ins = await sb.from("cs_contexts").insert({ group_id: groupId, type: "home", name: "Our Place", emoji: "🏠", closed: false });
+      if (ins.error) throw ins.error;
+    }
+
+    state.sync.mode = "supabase";
+    state.sync.groupId = groupId;
+    state.sync.groupName = groupRes.data.name;
+    state.sync.joinCode = groupRes.data.join_code;
+    state.sync.memberId = memberRes.data.id;
+    state.prefs.meMemberId = memberRes.data.id;
+    saveState();
+    await cloudPullNow({ toastOnSuccess: true });
+  }
+
+  async function cloudPullNow(opts) {
+    if (!isCloudEnabled()) return;
+    if (cloudPullInFlight) return;
+    cloudPullInFlight = true;
+    const toastOnSuccess = opts && opts.toastOnSuccess;
+    try {
+      const sb = await getSupabaseClient();
+      const groupId = state.sync.groupId;
+
+      const groupRes = await sb.from("cs_groups").select("id,name,join_code").eq("id", groupId).single();
+      if (groupRes.error) throw groupRes.error;
+
+      const membersRes = await sb.from("cs_members").select("id,name,emoji,created_at").eq("group_id", groupId).order("created_at", { ascending: true });
+      if (membersRes.error) throw membersRes.error;
+
+      const contextsRes = await sb.from("cs_contexts").select("id,type,name,emoji,closed,created_at").eq("group_id", groupId).order("created_at", { ascending: true });
+      if (contextsRes.error) throw contextsRes.error;
+
+      const expensesRes = await sb
+        .from("cs_expenses")
+        .select("id,context_id,title,amount_cents,paid_by,split_type,participants,shares,round_up_cents,created_at")
+        .eq("group_id", groupId)
+        .order("created_at", { ascending: false });
+      if (expensesRes.error) throw expensesRes.error;
+
+      const commentsRes = await sb
+        .from("cs_comments")
+        .select("id,expense_id,by_member_id,text,created_at")
+        .eq("group_id", groupId)
+        .order("created_at", { ascending: true });
+      if (commentsRes.error) throw commentsRes.error;
+
+      const poolsRes = await sb
+        .from("cs_pools")
+        .select("id,month,per_person_cents,created_at")
+        .eq("group_id", groupId)
+        .order("created_at", { ascending: true });
+      if (poolsRes.error) throw poolsRes.error;
+
+      const poolIds = (poolsRes.data || []).map((p) => p.id);
+      const contribRes = poolIds.length
+        ? await sb.from("cs_pool_contributions").select("pool_id,member_id,amount_cents").in("pool_id", poolIds)
+        : { data: [], error: null };
+      if (contribRes.error) throw contribRes.error;
+
+      const dedRes = poolIds.length
+        ? await sb.from("cs_pool_deductions").select("id,pool_id,title,emoji,amount_cents,at").in("pool_id", poolIds)
+        : { data: [], error: null };
+      if (dedRes.error) throw dedRes.error;
+
+      // Apply to local state (keep local prefs/theme).
+      state.sync.groupName = groupRes.data.name;
+      state.sync.joinCode = groupRes.data.join_code;
+
+      state.members = (membersRes.data || []).map((m) => ({ id: m.id, name: m.name, emoji: m.emoji || "🙂" }));
+      state.contexts = (contextsRes.data || []).map((c) => ({ id: c.id, type: c.type, name: c.name, emoji: c.emoji || "🧾", closed: Boolean(c.closed) }));
+
+      state.expenses = (expensesRes.data || []).map((e) => ({
+        id: e.id,
+        contextId: e.context_id,
+        title: e.title,
+        amountCents: Number(e.amount_cents || 0),
+        paidBy: e.paid_by,
+        split: {
+          type: e.split_type || "equal",
+          participants: Array.isArray(e.participants) ? e.participants : [],
+          shares: e.shares || undefined,
+        },
+        createdAt: e.created_at ? Date.parse(e.created_at) : Date.now(),
+        roundUpCents: Number(e.round_up_cents || 0),
+        receipt: null, // receipts stay local in this test build
+      }));
+
+      const commentsMap = {};
+      for (const c of (commentsRes.data || [])) {
+        const expId = c.expense_id;
+        if (!commentsMap[expId]) commentsMap[expId] = [];
+        commentsMap[expId].push({
+          id: c.id,
+          by: c.by_member_id,
+          text: c.text,
+          at: c.created_at ? Date.parse(c.created_at) : Date.now(),
+        });
+      }
+      state.comments = commentsMap;
+
+      const home = state.contexts.find((c) => c.type === "home");
+      const pools = {};
+      if (home) {
+        const byPoolIdContrib = {};
+        for (const r of (contribRes.data || [])) {
+          if (!byPoolIdContrib[r.pool_id]) byPoolIdContrib[r.pool_id] = {};
+          byPoolIdContrib[r.pool_id][r.member_id] = Number(r.amount_cents || 0);
+        }
+        const byPoolIdDed = {};
+        for (const r of (dedRes.data || [])) {
+          if (!byPoolIdDed[r.pool_id]) byPoolIdDed[r.pool_id] = [];
+          byPoolIdDed[r.pool_id].push({ id: r.id, title: r.title, emoji: r.emoji, amountCents: Number(r.amount_cents || 0), at: r.at ? Date.parse(r.at) : Date.now() });
+        }
+        for (const p of (poolsRes.data || [])) {
+          const key = `${home.id}:${p.month}`;
+          pools[key] = {
+            month: p.month,
+            perPersonCents: Number(p.per_person_cents || 0),
+            contributions: byPoolIdContrib[p.id] || {},
+            deductions: (byPoolIdDed[p.id] || []).sort((a, b) => (b.at || 0) - (a.at || 0)),
+          };
+        }
+      }
+      state.pools = pools;
+
+      state.sync.lastPullAt = Date.now();
+      saveState();
+      render();
+      if (toastOnSuccess) toast("Synced", "You're connected to the group.");
+    } catch (e) {
+      toast("Sync failed", String(e && e.message ? e.message : e));
+    } finally {
+      cloudPullInFlight = false;
+    }
+  }
+
 
   function getThemeResolved() {
     if (state.theme === "light" || state.theme === "dark") return state.theme;
@@ -664,7 +905,7 @@
 	      h(
 	        "div",
 	        { class: "itemTop" },
-	        h("div", { class: "itemTitle" }, "Leaderboard (broke bitches edition)"),
+	        h("div", { class: "itemTitle" }, "Leaderboard"),
 	        h("div", { class: "itemMeta" }, monthLabel(isoMonth)),
 	      ),
 	      h(
@@ -744,6 +985,169 @@
       ),
     );
 
+    const groupCard = (() => {
+      const urlVal = String(state.sync.supabaseUrl || "");
+      const keyVal = String(state.sync.supabaseAnonKey || "");
+
+      const urlInput = h("input", { id: "sbUrl", placeholder: "Supabase Project URL", value: urlVal });
+      const keyInput = h("input", { id: "sbKey", placeholder: "Supabase anon public key", value: keyVal });
+
+      const yourName = h("input", { id: "grpName", placeholder: "Your name (Ava)", value: "" });
+      const yourEmoji = h("input", { id: "grpEmoji", placeholder: "Emoji", value: "🙂" });
+      const groupName = h("input", { id: "newGroupName", placeholder: "Group name (Roommates, Trip Crew...)", value: "" });
+      const joinCode = h("input", { id: "joinCode", placeholder: "Join code", value: "" });
+
+      const connected = hasSupabaseConfig();
+      const inGroup = Boolean(state.sync.groupId);
+
+      const body = [];
+      body.push(h("div", { class: "itemMeta" }, "Multi-person groups need a backend. For this test build, we use Supabase (free tier) and a join code."));
+
+      body.push(
+        h("div", { class: "field" }, h("div", { class: "label" }, "Supabase URL"), urlInput),
+        h("div", { class: "field" }, h("div", { class: "label" }, "Supabase anon key"), keyInput),
+        h(
+          "div",
+          { class: "row" },
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              onClick: () => {
+                state.sync.mode = "supabase";
+                state.sync.supabaseUrl = urlInput.value.trim();
+                state.sync.supabaseAnonKey = keyInput.value.trim();
+                saveState();
+                toast("Saved", "Supabase config stored on this device.");
+                render();
+              },
+            },
+            "Save config",
+          ),
+          inGroup
+            ? h(
+                "button",
+                {
+                  class: "btn",
+                  type: "button",
+                  onClick: async () => {
+                    await cloudPullNow({ toastOnSuccess: true });
+                  },
+                },
+                "Sync now",
+              )
+            : null,
+        ),
+      );
+
+      if (!connected) {
+        body.push(h("div", { class: "itemMeta" }, "Add your Supabase URL + anon key above, then create or join a group."));
+        return h("div", { class: "item" }, h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Group sync (beta)"), h("div", { class: "itemMeta" }, "Not connected")), ...body);
+      }
+
+      if (!inGroup) {
+        body.push(h("div", { class: "hr" }));
+        body.push(h("div", { class: "itemTitle" }, "Create or join"));
+        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "Your name"), yourName));
+        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "Your emoji"), yourEmoji));
+        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "New group name"), groupName));
+        body.push(
+          h(
+            "button",
+            {
+              class: "btn primary",
+              type: "button",
+              onClick: async () => {
+                const n = yourName.value.trim();
+                const e = (yourEmoji.value || "🙂").trim();
+                const gn = groupName.value.trim();
+                if (!n) return toast("Add your name", "So friends know it's you.");
+                if (!gn) return toast("Name the group", "Like 'Roomies' or 'Trip crew'.");
+                try {
+                  await cloudCreateGroup(gn, n, e);
+                } catch (err) {
+                  toast("Couldn't create group", String(err && err.message ? err.message : err));
+                }
+              },
+            },
+            "Create group",
+          ),
+        );
+        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "Join code"), joinCode));
+        body.push(
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              onClick: async () => {
+                const n = yourName.value.trim();
+                const e = (yourEmoji.value || "🙂").trim();
+                const code = joinCode.value.trim().toUpperCase();
+                if (!n) return toast("Add your name", "So friends know it's you.");
+                if (!code) return toast("Add a code", "Ask your friend for the join code.");
+                try {
+                  await cloudJoinGroup(code, n, e);
+                } catch (err) {
+                  toast("Couldn't join", String(err && err.message ? err.message : err));
+                }
+              },
+            },
+            "Join group",
+          ),
+        );
+        return h("div", { class: "item" }, h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Group sync (beta)"), h("div", { class: "itemMeta" }, "Ready")), ...body);
+      }
+
+      body.push(h("div", { class: "hr" }));
+      body.push(h("div", { class: "itemTitle" }, `Group: ${state.sync.groupName || "Your group"}`));
+      body.push(h("div", { class: "itemMeta" }, `Join code: ${state.sync.joinCode || "(pull to sync)"}`));
+      body.push(
+        h(
+          "div",
+          { class: "row" },
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              onClick: async () => {
+                try {
+                  await navigator.clipboard.writeText(String(state.sync.joinCode || ""));
+                  toast("Copied", "Send that code to friends so they can join.");
+                } catch {
+                  toast("Copy didn't work", "Your browser may block clipboard access.");
+                }
+              },
+            },
+            "Copy code",
+          ),
+          h(
+            "button",
+            {
+              class: "btn ghost",
+              type: "button",
+              onClick: () => {
+                const base = defaultState();
+                const keepTheme = state.theme;
+                const keepPrefs = state.prefs;
+                const keepSync = { ...state.sync, groupId: null, groupName: null, joinCode: null, memberId: null };
+                state = { ...base, theme: keepTheme, prefs: keepPrefs, sync: keepSync };
+                saveState();
+                render();
+                toast("Left group", "You're back to local-only mode.");
+              },
+            },
+            "Leave group",
+          ),
+        ),
+      );
+      body.push(h("div", { class: "itemMeta" }, "Anyone with the join code can join this test group."));
+
+      return h("div", { class: "item" }, h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Group sync (beta)"), h("div", { class: "itemMeta" }, "Connected")), ...body);
+    })();
+
     const themeRow = h(
       "div",
       { class: "item" },
@@ -811,7 +1215,7 @@
       ),
     );
 
-    return h("div", { class: "list" }, panel("Me", "A little control, no fuss.", null, [mePick, themeRow, quietToggle, roundUpToggle, paymentsInfo, reset]));
+    return h("div", { class: "list" }, panel("Me", "A little control, no fuss.", null, [mePick, groupCard, themeRow, quietToggle, roundUpToggle, paymentsInfo, reset]));
   }
 
   function toggleRow(title, subtitle, initialOn, onChange) {
@@ -929,8 +1333,20 @@
           ctx.closed ? "Trip is closed" : "Trip is open",
           ctx.closed ? "Re-open if you need to add something." : "Close it when everyone's settled.",
           ctx.closed,
-          (on) => {
+          async (on) => {
             ctx.closed = on;
+            if (isCloudEnabled()) {
+              try {
+                const sb = await getSupabaseClient();
+                const up = await sb.from("cs_contexts").update({ closed: on }).eq("group_id", state.sync.groupId).eq("id", ctx.id);
+                if (up.error) throw up.error;
+                await cloudPullNow();
+                toast(on ? "Trip closed" : "Trip re-opened");
+              } catch (e) {
+                toast("Couldn't update trip", String(e && e.message ? e.message : e));
+              }
+              return;
+            }
             saveState();
             render();
             toast(on ? "Trip closed" : "Trip re-opened");
@@ -1119,7 +1535,7 @@
       return true;
     }
 
-    function finish() {
+    async function finish() {
       const t = title.value.trim();
       const cents = parseMoneyToCents(amount.value);
       const contextId = ctxSelect.value;
@@ -1131,6 +1547,28 @@
       if (!withFriends) {
         const me = state.prefs.meMemberId || state.members[0]?.id;
         if (!me) return;
+        if (isCloudEnabled()) {
+          try {
+            const sb = await getSupabaseClient();
+            const ins = await sb.from("cs_expenses").insert({
+              group_id: state.sync.groupId,
+              context_id: contextId,
+              title: t,
+              amount_cents: cents,
+              paid_by: me,
+              split_type: "equal",
+              participants: [me],
+              shares: null,
+              round_up_cents: 0,
+            });
+            if (ins.error) throw ins.error;
+            await cloudPullNow();
+            toast("Added", "Tracked. Shared with the group.");
+          } catch (e) {
+            toast("Couldn't add", String(e && e.message ? e.message : e));
+          }
+          return;
+        }
         state.expenses.push({
           id: uid("e"),
           contextId,
@@ -1211,10 +1649,23 @@
       {
         label: "Create",
         kind: "primary",
-        onClick: () => {
+        onClick: async () => {
           const name = document.getElementById("tripName").value.trim();
           const emoji = document.getElementById("tripEmoji").value.trim() || "🧳";
           if (!name) return toast("Name it", "Something like 'Catskills Weekend'.");
+          if (isCloudEnabled()) {
+            try {
+              const sb = await getSupabaseClient();
+              const ins = await sb.from("cs_contexts").insert({ group_id: state.sync.groupId, type: "trip", name, emoji, closed: false });
+              if (ins.error) throw ins.error;
+              closeModal();
+              await cloudPullNow();
+              toast("Trip created", "Invite friends whenever.");
+            } catch (e) {
+              toast("Couldn't create trip", String(e && e.message ? e.message : e));
+            }
+            return;
+          }
           state.contexts.push({ id: uid("c"), type: "trip", name, emoji, closed: false });
           saveState();
           closeModal();
@@ -1260,12 +1711,36 @@
       {
         label: "Save",
         kind: "primary",
-        onClick: () => {
+        onClick: async () => {
           const perCents = parseMoneyToCents(document.getElementById("poolPer").value) || 0;
           const next = { month, perPersonCents: perCents, contributions: {}, deductions: pool.deductions || [] };
           for (const m of state.members) {
             const v = parseMoneyToCents(document.getElementById(`pool_${m.id}`).value);
             next.contributions[m.id] = v != null ? v : perCents;
+          }
+          if (isCloudEnabled()) {
+            try {
+              const sb = await getSupabaseClient();
+              const up = await sb
+                .from("cs_pools")
+                .upsert({ group_id: state.sync.groupId, month, per_person_cents: perCents }, { onConflict: "group_id,month" })
+                .select("id")
+                .single();
+              if (up.error) throw up.error;
+              const poolId = up.data.id;
+              for (const [mid, cents] of Object.entries(next.contributions)) {
+                const res = await sb
+                  .from("cs_pool_contributions")
+                  .upsert({ pool_id: poolId, member_id: mid, amount_cents: Number(cents || 0) }, { onConflict: "pool_id,member_id" });
+                if (res.error) throw res.error;
+              }
+              closeModal();
+              await cloudPullNow();
+              toast("Pool updated", "Auto-deductions will nibble from this.");
+            } catch (e) {
+              toast("Couldn't save pool", String(e && e.message ? e.message : e));
+            }
+            return;
           }
           state.pools[key] = next;
           saveState();
@@ -1291,7 +1766,7 @@
       {
         label: "Add",
         kind: "primary",
-        onClick: () => {
+        onClick: async () => {
           const title = document.getElementById("dedTitle").value.trim();
           const emoji = document.getElementById("dedEmoji").value.trim() || "🧾";
           const amountCents = parseMoneyToCents(document.getElementById("dedAmount").value);
@@ -1299,6 +1774,27 @@
           if (!amountCents || amountCents <= 0) return toast("Add an amount", "Like 15.99");
           const key = `${homeId}:${month}`;
           const pool = state.pools[key] || { month, perPersonCents: 0, contributions: {}, deductions: [] };
+          if (isCloudEnabled()) {
+            try {
+              const sb = await getSupabaseClient();
+              const up = await sb
+                .from("cs_pools")
+                .upsert({ group_id: state.sync.groupId, month, per_person_cents: Number(pool.perPersonCents || 0) }, { onConflict: "group_id,month" })
+                .select("id")
+                .single();
+              if (up.error) throw up.error;
+              const ins = await sb
+                .from("cs_pool_deductions")
+                .insert({ pool_id: up.data.id, title, emoji, amount_cents: amountCents, at: new Date().toISOString() });
+              if (ins.error) throw ins.error;
+              closeModal();
+              await cloudPullNow();
+              toast("Deducted", `${emoji} ${title} subtracted from the pool.`);
+            } catch (e) {
+              toast("Couldn't add deduction", String(e && e.message ? e.message : e));
+            }
+            return;
+          }
           pool.deductions = pool.deductions || [];
           pool.deductions.push({ id: uid("d"), title, emoji, amountCents, at: Date.now() });
           state.pools[key] = pool;
@@ -1498,7 +1994,7 @@
       {
         label: "Add",
         kind: "primary",
-        onClick: () => {
+        onClick: async () => {
           const t = title.value.trim();
           const amountCents = parseMoneyToCents(amount.value);
           if (!t) return toast("Add a title", "Like 'Dinner' or 'Groceries'.");
@@ -1540,7 +2036,30 @@
             exp.split.shares = shares;
           }
 
-          const persist = () => {
+          const persist = async () => {
+            if (isCloudEnabled()) {
+              try {
+                const sb = await getSupabaseClient();
+                const ins = await sb.from("cs_expenses").insert({
+                  group_id: state.sync.groupId,
+                  context_id: exp.contextId,
+                  title: exp.title,
+                  amount_cents: exp.amountCents,
+                  paid_by: exp.paidBy,
+                  split_type: exp.split.type,
+                  participants: exp.split.participants,
+                  shares: exp.split.shares || null,
+                  round_up_cents: exp.roundUpCents || 0,
+                });
+                if (ins.error) throw ins.error;
+                closeModal();
+                await cloudPullNow();
+                toast("Added", "Saved to the group.");
+              } catch (e) {
+                toast("Couldn't add expense", String(e && e.message ? e.message : e));
+              }
+              return;
+            }
             state.expenses.push(exp);
             saveState();
             closeModal();
@@ -1565,7 +2084,7 @@
             return;
           }
 
-          persist();
+          await persist();
         },
       },
     ]);
@@ -1643,7 +2162,21 @@
       {
         label: "Delete",
         kind: "ghost",
-        onClick: () => {
+        onClick: async () => {
+          if (isCloudEnabled()) {
+            try {
+              const sb = await getSupabaseClient();
+              await sb.from("cs_comments").delete().eq("group_id", state.sync.groupId).eq("expense_id", expenseId);
+              const del = await sb.from("cs_expenses").delete().eq("group_id", state.sync.groupId).eq("id", expenseId);
+              if (del.error) throw del.error;
+              closeModal();
+              await cloudPullNow();
+              toast("Removed", "Deleted from the group.");
+            } catch (e) {
+              toast("Couldn't delete", String(e && e.message ? e.message : e));
+            }
+            return;
+          }
           state.expenses = state.expenses.filter((e) => e.id !== expenseId);
           delete state.comments[expenseId];
           saveState();
@@ -1655,11 +2188,29 @@
       {
         label: "Save",
         kind: "primary",
-        onClick: () => {
+        onClick: async () => {
           const t = title.value.trim();
           const amountCents = parseMoneyToCents(amount.value);
           if (!t) return toast("Needs a title", "Quick + clear.");
           if (!amountCents || amountCents <= 0) return toast("Needs an amount", "Like 12.00");
+          if (isCloudEnabled()) {
+            try {
+              const sb = await getSupabaseClient();
+              const roundUpCents = expense.roundUpCents ? (Math.ceil(amountCents / 100) * 100) - amountCents : 0;
+              const up = await sb
+                .from("cs_expenses")
+                .update({ title: t, amount_cents: amountCents, round_up_cents: roundUpCents })
+                .eq("group_id", state.sync.groupId)
+                .eq("id", expenseId);
+              if (up.error) throw up.error;
+              closeModal();
+              await cloudPullNow();
+              toast("Updated", "Saved to the group.");
+            } catch (e) {
+              toast("Couldn't save", String(e && e.message ? e.message : e));
+            }
+            return;
+          }
           expense.title = t;
           expense.amountCents = amountCents;
           // If the amount changed, re-evaluate round-up.
@@ -1714,9 +2265,28 @@
       {
         label: "Post",
         kind: "primary",
-        onClick: () => {
+        onClick: async () => {
           const text = input.value.trim();
           if (!text) return toast("Type something", "Even a single emoji counts.");
+          if (isCloudEnabled()) {
+            try {
+              const sb = await getSupabaseClient();
+              const ins = await sb.from("cs_comments").insert({
+                group_id: state.sync.groupId,
+                expense_id: expenseId,
+                by_member_id: by.value,
+                text,
+                created_at: new Date().toISOString(),
+              });
+              if (ins.error) throw ins.error;
+              closeModal();
+              await cloudPullNow();
+              toast("Posted", "Shared with the group.");
+            } catch (e) {
+              toast("Couldn't post", String(e && e.message ? e.message : e));
+            }
+            return;
+          }
           const c = { id: uid("cmt"), by: by.value, text, at: Date.now() };
           state.comments[expenseId] = [...(state.comments[expenseId] || []), c];
           saveState();
@@ -1984,6 +2554,14 @@
   // Initial render
   applyTheme();
   render();
+
+  // If cloud sync is configured, pull once on boot and then poll occasionally (simple, works everywhere).
+  if (isCloudEnabled()) {
+    cloudPullNow();
+    setInterval(() => {
+      if (state.sync.autoSync && isCloudEnabled()) cloudPullNow();
+    }, 8000);
+  }
 
   // PWA: best-effort service worker registration (works on https/localhost).
   if ("serviceWorker" in navigator) {
