@@ -20,46 +20,46 @@
 
 /* Theme: Light (Duolingo-ish bright + clean) */
 html[data-theme="light"] {
-  --bg: #f4f6f8;
+  --bg: #f6f7f9;
   --panel: #ffffff;
   --panelSolid: #ffffff;
-  --ink: #111827;
-  --muted: rgba(17, 24, 39, 0.62);
-  --faint: rgba(17, 24, 39, 0.08);
-  --line: rgba(17, 24, 39, 0.12);
+  --ink: #0b0f14;
+  --muted: rgba(11, 15, 20, 0.62);
+  --faint: rgba(11, 15, 20, 0.08);
+  --line: rgba(11, 15, 20, 0.12);
 
-  --primary: #3b82f6; /* blue */
-  --primary2: #f97316; /* orange */
-  --primary3: #22c55e; /* green */
+  --primary: #2563eb; /* blue highlight */
+  --primary2: #60a5fa;
+  --primary3: #22c55e;
 
   --accent: var(--primary);
   --accent2: var(--primary2);
   --accent3: var(--primary3);
 
   --good: #16a34a;
-  --warn: #f97316;
+  --warn: #f59e0b;
 }
 
 /* Theme: Dark (website-y dark mode) */
 html[data-theme="dark"] {
-  --bg: #0b0f17;
-  --panel: #111827;
-  --panelSolid: #111827;
-  --ink: #e5e7eb;
-  --muted: rgba(229, 231, 235, 0.68);
-  --faint: rgba(229, 231, 235, 0.08);
-  --line: rgba(229, 231, 235, 0.14);
+  --bg: #0b0f14;      /* ChatGPT-ish dark */
+  --panel: #151a23;   /* surface */
+  --panelSolid: #151a23;
+  --ink: #e6e8ee;
+  --muted: rgba(230, 232, 238, 0.68);
+  --faint: rgba(230, 232, 238, 0.08);
+  --line: rgba(230, 232, 238, 0.14);
 
-  --primary: #60a5fa; /* blue */
-  --primary2: #fb923c; /* orange */
-  --primary3: #22c55e; /* green */
+  --primary: #3b82f6; /* blue highlight */
+  --primary2: #60a5fa;
+  --primary3: #22c55e;
 
   --accent: var(--primary);
   --accent2: var(--primary2);
   --accent3: var(--primary3);
 
   --good: #22c55e;
-  --warn: #fb923c;
+  --warn: #fbbf24;
 }
 
 * {
@@ -82,9 +82,9 @@ body {
   position: fixed;
   inset: 0;
   pointer-events: none;
-  background-image: radial-gradient(900px 620px at 18% 0%, rgba(59, 130, 246, 0.16), transparent 60%),
-    radial-gradient(800px 540px at 100% 18%, rgba(249, 115, 22, 0.10), transparent 62%),
-    radial-gradient(820px 560px at 50% 110%, rgba(34, 197, 94, 0.06), transparent 62%);
+  background-image: radial-gradient(900px 620px at 18% 0%, rgba(37, 99, 235, 0.14), transparent 60%),
+    radial-gradient(800px 540px at 100% 18%, rgba(96, 165, 250, 0.10), transparent 62%),
+    radial-gradient(820px 560px at 50% 110%, rgba(34, 197, 94, 0.05), transparent 62%);
   opacity: 0.9;
 }
 

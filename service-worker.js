@@ -1,11 +1,12 @@
 /* Simple offline shell cache for the ChillSplit PWA prototype. */
-const CACHE_NAME = "chillsplit-shell-v1";
+const CACHE_NAME = "chillsplit-shell-v3";
 const ASSETS = [
   "./",
   "./index.html",
   "./app.css",
   "./app.js",
   "./manifest.webmanifest",
+  "./service-worker.js",
   "./icon.svg"
 ];
 
@@ -42,4 +43,3 @@ self.addEventListener("fetch", (event) => {
     );
   }
 });
-

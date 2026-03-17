@@ -3,8 +3,8 @@
   "short_name": "ChillSplit",
   "start_url": "./",
   "display": "standalone",
-  "background_color": "#f4f6f8",
-  "theme_color": "#3B82F6",
+  "background_color": "#0B0F14",
+  "theme_color": "#0B0F14",
   "icons": [
     {
       "src": "./icon.svg",
