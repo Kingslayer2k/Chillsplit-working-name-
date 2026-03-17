@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#58CC02" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="ChillSplit" />
+    <title>ChillSplit</title>
+    <link rel="manifest" href="./manifest.webmanifest" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&family=Nunito:wght@500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./app.css" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <script defer src="./app.js"></script>
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true"></div>
+
+    <div class="shell" id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark" aria-hidden="true">🧊</div>
+          <div class="brandText">
+            <div class="brandName">ChillSplit</div>
+            <div class="brandTag">Split stuff, keep it friendly.</div>
+          </div>
+        </div>
+
+        <div class="topActions">
+          <button class="iconBtn" id="quickAddBtn" type="button" aria-label="Quick add">
+            <span class="icon" aria-hidden="true">＋</span>
+          </button>
+          <button class="iconBtn" id="themeBtn" type="button" aria-label="Toggle theme">
+            <span class="icon" aria-hidden="true">🌗</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="main" id="main" aria-live="polite"></main>
+
+      <nav class="tabbar" aria-label="Primary">
+        <button class="tab" type="button" data-tab="trips" aria-current="page">
+          <span class="tabIcon" aria-hidden="true">🧳</span>
+          <span class="tabLabel">Trips</span>
+        </button>
+        <button class="tab" type="button" data-tab="roomies">
+          <span class="tabIcon" aria-hidden="true">🏠</span>
+          <span class="tabLabel">Roomies</span>
+        </button>
+        <button class="tab" type="button" data-tab="inbox">
+          <span class="tabIcon" aria-hidden="true">💬</span>
+          <span class="tabLabel">Notes</span>
+        </button>
+        <button class="tab" type="button" data-tab="me">
+          <span class="tabIcon" aria-hidden="true">✨</span>
+          <span class="tabLabel">Me</span>
+        </button>
+      </nav>
+    </div>
+
+    <div class="toastHost" id="toastHost" aria-live="polite" aria-atomic="true"></div>
+
+    <div class="modalHost" id="modalHost" aria-hidden="true"></div>
+  </body>
+</html>
