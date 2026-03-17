@@ -1,11 +1,23 @@
 (() => {
   "use strict";
 
+  // Built-in backend (optional): set these once, push to GitHub Pages, and nobody
+  // has to paste keys on every phone.
+  //
+  // Heads up: Supabase "anon" keys are public by design. Security comes from
+  // Row Level Security (RLS) policies, not secrecy. For a school prototype this
+  // is fine; for a real launch you must lock down your tables.
+  const BUILT_IN_BACKEND = {
+    supabaseUrl: "https://whqpdpiilpepdncbjejm.supabase.co",
+    supabaseAnonKey: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndocXBkcGlpbHBlcGRuY2JqZWptIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM3NTgxMzAsImV4cCI6MjA4OTMzNDEzMH0.iDMjnhjmIeXduslkOaT8CZqE-hy1VDwDLiGIQjfFcWE",
+  };
+
   const STORAGE_KEY = "chillsplit:v1";
 
   const elMain = document.getElementById("main");
   const elQuickAddBtn = document.getElementById("quickAddBtn");
   const elThemeBtn = document.getElementById("themeBtn");
+  const elMenuBtn = document.getElementById("menuBtn");
   const elTabs = Array.from(document.querySelectorAll(".tabbar .tab"));
   const elModalHost = document.getElementById("modalHost");
   const elToastHost = document.getElementById("toastHost");
@@ -122,6 +134,7 @@
       theme: "system", // system | light | dark
       tab: "trips",
       view: { kind: "tab" }, // tab | context
+      profile: { name: "", emoji: "🙂" },
       members,
       contexts,
       expenses,
@@ -135,6 +148,7 @@
         groupName: null,
         joinCode: null,
         memberId: null,
+        hostMemberId: null,
         lastPullAt: 0,
         autoSync: true,
       },
@@ -156,6 +170,7 @@
       return {
         ...base,
         ...parsed,
+        profile: { ...base.profile, ...(parsed.profile || {}) },
         prefs: { ...base.prefs, ...(parsed.prefs || {}) },
         sync: { ...base.sync, ...(parsed.sync || {}) },
         view: parsed.view || { kind: "tab" },
@@ -170,12 +185,29 @@
   }
 
   let state = loadState();
+  applyBuiltInBackend();
   const reduceMotion = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  function applyBuiltInBackend() {
+    let changed = false;
+    if (!state.sync.supabaseUrl && BUILT_IN_BACKEND.supabaseUrl) {
+      state.sync.supabaseUrl = BUILT_IN_BACKEND.supabaseUrl;
+      changed = true;
+    }
+    if (!state.sync.supabaseAnonKey && BUILT_IN_BACKEND.supabaseAnonKey) {
+      state.sync.supabaseAnonKey = BUILT_IN_BACKEND.supabaseAnonKey;
+      changed = true;
+    }
+    if (changed) saveState();
+  }
 
   // ---- Cloud Sync (Supabase) -------------------------------------------------
   let supabaseClient = null;
   let supabaseClientCacheKey = null;
   let cloudPullInFlight = false;
+  let cloudCreateInFlight = false;
+  let cloudJoinInFlight = false;
+  let cloudPollTimer = null;
 
   function hasSupabaseConfig() {
     return Boolean(state.sync.supabaseUrl && state.sync.supabaseAnonKey);
@@ -209,73 +241,94 @@
   }
 
   async function cloudCreateGroup(groupName, myName, myEmoji) {
-    const sb = await getSupabaseClient();
-    const joinCode = randomJoinCode(8);
-    const groupRes = await sb
-      .from("cs_groups")
-      .insert({ name: groupName, join_code: joinCode })
-      .select("id,name,join_code")
-      .single();
-    if (groupRes.error) throw groupRes.error;
+    if (cloudCreateInFlight) return;
+    cloudCreateInFlight = true;
+    try {
+      const sb = await getSupabaseClient();
+      const joinCode = randomJoinCode(8);
+      const groupRes = await sb
+        .from("cs_groups")
+        .insert({ name: groupName, join_code: joinCode })
+        .select("id,name,join_code")
+        .single();
+      if (groupRes.error) throw groupRes.error;
 
-    const groupId = groupRes.data.id;
-    const memberRes = await sb
-      .from("cs_members")
-      .insert({ group_id: groupId, name: myName, emoji: myEmoji })
-      .select("id")
-      .single();
-    if (memberRes.error) throw memberRes.error;
+      const groupId = groupRes.data.id;
+      const memberRes = await sb
+        .from("cs_members")
+        .insert({ group_id: groupId, name: myName, emoji: myEmoji })
+        .select("id")
+        .single();
+      if (memberRes.error) throw memberRes.error;
 
-    const contextsRes = await sb
-      .from("cs_contexts")
-      .insert({ group_id: groupId, type: "home", name: "Our Place", emoji: "🏠", closed: false })
-      .select("id");
-    if (contextsRes.error) throw contextsRes.error;
+      const contextsRes = await sb
+        .from("cs_contexts")
+        .insert({ group_id: groupId, type: "home", name: "Our Place", emoji: "🏠", closed: false })
+        .select("id");
+      if (contextsRes.error) throw contextsRes.error;
 
-    state.sync.mode = "supabase";
-    state.sync.groupId = groupId;
-    state.sync.groupName = groupRes.data.name;
-    state.sync.joinCode = groupRes.data.join_code;
-    state.sync.memberId = memberRes.data.id;
-    state.prefs.meMemberId = memberRes.data.id;
-    saveState();
-    await cloudPullNow({ toastOnSuccess: true });
+      state.profile.name = myName;
+      state.profile.emoji = myEmoji || "🙂";
+
+      state.sync.mode = "supabase";
+      state.sync.groupId = groupId;
+      state.sync.groupName = groupRes.data.name;
+      state.sync.joinCode = groupRes.data.join_code;
+      state.sync.memberId = memberRes.data.id;
+      state.sync.hostMemberId = memberRes.data.id;
+      state.prefs.meMemberId = memberRes.data.id;
+      saveState();
+      ensureCloudPolling();
+      await cloudPullNow({ toastOnSuccess: true });
+    } finally {
+      cloudCreateInFlight = false;
+    }
   }
 
   async function cloudJoinGroup(joinCode, myName, myEmoji) {
-    const sb = await getSupabaseClient();
-    const groupRes = await sb
-      .from("cs_groups")
-      .select("id,name,join_code")
-      .eq("join_code", joinCode)
-      .maybeSingle();
-    if (groupRes.error) throw groupRes.error;
-    if (!groupRes.data) throw new Error("No group found for that code");
+    if (cloudJoinInFlight) return;
+    cloudJoinInFlight = true;
+    try {
+      const sb = await getSupabaseClient();
+      const groupRes = await sb
+        .from("cs_groups")
+        .select("id,name,join_code")
+        .eq("join_code", joinCode)
+        .maybeSingle();
+      if (groupRes.error) throw groupRes.error;
+      if (!groupRes.data) throw new Error("No group found for that code");
 
-    const groupId = groupRes.data.id;
-    const memberRes = await sb
-      .from("cs_members")
-      .insert({ group_id: groupId, name: myName, emoji: myEmoji })
-      .select("id")
-      .single();
-    if (memberRes.error) throw memberRes.error;
+      const groupId = groupRes.data.id;
+      const memberRes = await sb
+        .from("cs_members")
+        .insert({ group_id: groupId, name: myName, emoji: myEmoji })
+        .select("id")
+        .single();
+      if (memberRes.error) throw memberRes.error;
 
-    // Ensure there's at least a home context.
-    const ctxRes = await sb.from("cs_contexts").select("id").eq("group_id", groupId).eq("type", "home").limit(1);
-    if (ctxRes.error) throw ctxRes.error;
-    if (!ctxRes.data || ctxRes.data.length === 0) {
-      const ins = await sb.from("cs_contexts").insert({ group_id: groupId, type: "home", name: "Our Place", emoji: "🏠", closed: false });
-      if (ins.error) throw ins.error;
+      // Ensure there's at least a home context.
+      const ctxRes = await sb.from("cs_contexts").select("id").eq("group_id", groupId).eq("type", "home").limit(1);
+      if (ctxRes.error) throw ctxRes.error;
+      if (!ctxRes.data || ctxRes.data.length === 0) {
+        const ins = await sb.from("cs_contexts").insert({ group_id: groupId, type: "home", name: "Our Place", emoji: "🏠", closed: false });
+        if (ins.error) throw ins.error;
+      }
+
+      state.profile.name = myName;
+      state.profile.emoji = myEmoji || "🙂";
+
+      state.sync.mode = "supabase";
+      state.sync.groupId = groupId;
+      state.sync.groupName = groupRes.data.name;
+      state.sync.joinCode = groupRes.data.join_code;
+      state.sync.memberId = memberRes.data.id;
+      state.prefs.meMemberId = memberRes.data.id;
+      saveState();
+      ensureCloudPolling();
+      await cloudPullNow({ toastOnSuccess: true });
+    } finally {
+      cloudJoinInFlight = false;
     }
-
-    state.sync.mode = "supabase";
-    state.sync.groupId = groupId;
-    state.sync.groupName = groupRes.data.name;
-    state.sync.joinCode = groupRes.data.join_code;
-    state.sync.memberId = memberRes.data.id;
-    state.prefs.meMemberId = memberRes.data.id;
-    saveState();
-    await cloudPullNow({ toastOnSuccess: true });
   }
 
   async function cloudPullNow(opts) {
@@ -331,6 +384,7 @@
       // Apply to local state (keep local prefs/theme).
       state.sync.groupName = groupRes.data.name;
       state.sync.joinCode = groupRes.data.join_code;
+      state.sync.hostMemberId = (membersRes.data && membersRes.data[0] && membersRes.data[0].id) ? membersRes.data[0].id : null;
 
       state.members = (membersRes.data || []).map((m) => ({ id: m.id, name: m.name, emoji: m.emoji || "🙂" }));
       state.contexts = (contextsRes.data || []).map((c) => ({ id: c.id, type: c.type, name: c.name, emoji: c.emoji || "🧾", closed: Boolean(c.closed) }));
@@ -400,6 +454,14 @@
     }
   }
 
+  function ensureCloudPolling() {
+    if (cloudPollTimer) return;
+    cloudPollTimer = setInterval(() => {
+      if (!state.sync.autoSync) return;
+      if (!isCloudEnabled()) return;
+      cloudPullNow();
+    }, 8000);
+  }
 
   function getThemeResolved() {
     if (state.theme === "light" || state.theme === "dark") return state.theme;
@@ -594,6 +656,27 @@
     return transfers;
   }
 
+  function computeMyLedger() {
+    const meId = state.prefs.meMemberId;
+    const owes = {};
+    const owed = {};
+    if (!meId) return { owes, owed, owesTotal: 0, owedTotal: 0 };
+
+    // For "Me" we only count open contexts. Closed trips should feel done.
+    for (const ctx of state.contexts) {
+      if (ctx.closed) continue;
+      const transfers = computeSettleTransfers(computeBalances(ctx.id));
+      for (const t of transfers) {
+        if (t.from === meId) owes[t.to] = (owes[t.to] || 0) + t.amountCents;
+        else if (t.to === meId) owed[t.from] = (owed[t.from] || 0) + t.amountCents;
+      }
+    }
+
+    const owesTotal = Object.values(owes).reduce((s, v) => s + Number(v || 0), 0);
+    const owedTotal = Object.values(owed).reduce((s, v) => s + Number(v || 0), 0);
+    return { owes, owed, owesTotal, owedTotal };
+  }
+
   function computeMonthlyContributedTotals(monthKey) {
     const totals = Object.fromEntries(state.members.map((m) => [m.id, 0]));
 
@@ -661,37 +744,71 @@
   }
 
   function render() {
-    applyTheme();
+    try {
+      applyTheme();
 
-    for (const el of elTabs) {
-      const tab = el.getAttribute("data-tab");
-      if (tab === state.tab) el.setAttribute("aria-current", "page");
-      else el.removeAttribute("aria-current");
-    }
+      for (const el of elTabs) {
+        const tab = el.getAttribute("data-tab");
+        if (tab === state.tab) el.setAttribute("aria-current", "page");
+        else el.removeAttribute("aria-current");
+      }
 
-    if (state.view.kind === "context") {
-      elMain.replaceChildren(renderContextScreen(state.view.contextId));
-      animateIn(elMain.firstElementChild);
-      return;
-    }
+      if (state.view.kind === "context") {
+        elMain.replaceChildren(renderContextScreen(state.view.contextId));
+        animateIn(elMain.firstElementChild);
+        return;
+      }
 
-    if (state.tab === "trips") {
-      elMain.replaceChildren(renderTripsTab());
+      if (state.tab === "trips") {
+        elMain.replaceChildren(renderTripsTab());
+        animateIn(elMain.firstElementChild);
+        return;
+      }
+      if (state.tab === "roomies") {
+        elMain.replaceChildren(renderRoomiesTab());
+        animateIn(elMain.firstElementChild);
+        return;
+      }
+      if (state.tab === "inbox") {
+        elMain.replaceChildren(renderInboxTab());
+        animateIn(elMain.firstElementChild);
+        return;
+      }
+      elMain.replaceChildren(renderMeTab());
       animateIn(elMain.firstElementChild);
-      return;
+    } catch (e) {
+      console.error("render failed", e);
+      const msg = String(e && e.message ? e.message : e);
+      elMain.replaceChildren(
+        h(
+          "div",
+          { class: "list" },
+          h(
+            "div",
+            { class: "item" },
+            h("div", { class: "itemTitle" }, "Something glitched"),
+            h("div", { class: "itemMeta" }, msg),
+            h(
+              "div",
+              { class: "row" },
+              h("button", { class: "btn primary", type: "button", onClick: () => location.reload() }, "Reload"),
+              h(
+                "button",
+                {
+                  class: "btn",
+                  type: "button",
+                  onClick: () => {
+                    localStorage.removeItem(STORAGE_KEY);
+                    location.reload();
+                  },
+                },
+                "Reset device",
+              ),
+            ),
+          ),
+        ),
+      );
     }
-    if (state.tab === "roomies") {
-      elMain.replaceChildren(renderRoomiesTab());
-      animateIn(elMain.firstElementChild);
-      return;
-    }
-    if (state.tab === "inbox") {
-      elMain.replaceChildren(renderInboxTab());
-      animateIn(elMain.firstElementChild);
-      return;
-    }
-    elMain.replaceChildren(renderMeTab());
-    animateIn(elMain.firstElementChild);
   }
 
   function animateIn(el) {
@@ -958,13 +1075,10 @@
   }
 
   function renderMeTab() {
-    const resolved = getThemeResolved();
-    const themeLabel = state.theme === "system" ? `Auto (${resolved})` : state.theme;
-
     const mePick = h(
       "div",
       { class: "item" },
-      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Me"), h("div", { class: "itemMeta" }, "For friendlier copy")),
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "You"), h("div", { class: "itemMeta" }, "Who are you in this group?")),
       h(
         "div",
         { class: "field" },
@@ -976,7 +1090,7 @@
             onChange: (e) => {
               state.prefs.meMemberId = e.target.value;
               saveState();
-              toast("Updated", "Now the app knows which line is 'you'.");
+              toast("Updated", "Now ChillSplit knows which line is 'you'.");
               render();
             },
           },
@@ -985,168 +1099,198 @@
       ),
     );
 
-    const groupCard = (() => {
-      const urlVal = String(state.sync.supabaseUrl || "");
-      const keyVal = String(state.sync.supabaseAnonKey || "");
+    const ledger = computeMyLedger();
 
-      const urlInput = h("input", { id: "sbUrl", placeholder: "Supabase Project URL", value: urlVal });
-      const keyInput = h("input", { id: "sbKey", placeholder: "Supabase anon public key", value: keyVal });
+    function renderLedgerList(map, emptyText) {
+      const rows = Object.entries(map || {})
+        .map(([mid, cents]) => ({ mid, cents: Number(cents || 0) }))
+        .filter((r) => r.cents > 0)
+        .sort((a, b) => b.cents - a.cents);
+      if (rows.length === 0) return h("div", { class: "itemMeta" }, emptyText);
+      return h(
+        "div",
+        { class: "list" },
+        ...rows.map((r) => {
+          const m = memberById(r.mid);
+          return h(
+            "div",
+            { class: "row" },
+            h("div", null, h("span", { class: "itemTitle" }, m ? `${m.emoji} ${m.name}` : "Someone")),
+            h("div", { class: "itemMeta mono" }, formatMoney(r.cents)),
+          );
+        }),
+      );
+    }
 
-      const yourName = h("input", { id: "grpName", placeholder: "Your name (Ava)", value: "" });
-      const yourEmoji = h("input", { id: "grpEmoji", placeholder: "Emoji", value: "🙂" });
-      const groupName = h("input", { id: "newGroupName", placeholder: "Group name (Roommates, Trip Crew...)", value: "" });
-      const joinCode = h("input", { id: "joinCode", placeholder: "Join code", value: "" });
+    const oweCard = h(
+      "div",
+      { class: "item" },
+      h(
+        "div",
+        { class: "itemTop" },
+        h("div", { class: "itemTitle" }, "You owe"),
+        ledger.owesTotal > 0 ? h("span", { class: "badge warn mono" }, formatMoney(ledger.owesTotal)) : h("span", { class: "badge good" }, "All even"),
+      ),
+      renderLedgerList(ledger.owes, "Nothing right now."),
+      ledger.owesTotal > 0 ? h("div", { class: "itemMeta" }, "Tip: open a trip to see the settle buttons.") : null,
+    );
 
-      const connected = hasSupabaseConfig();
+    const owedCard = h(
+      "div",
+      { class: "item" },
+      h(
+        "div",
+        { class: "itemTop" },
+        h("div", { class: "itemTitle" }, "Owed to you"),
+        ledger.owedTotal > 0 ? h("span", { class: "badge good mono" }, formatMoney(ledger.owedTotal)) : h("span", { class: "badge" }, "Quiet"),
+      ),
+      renderLedgerList(ledger.owed, "Nothing right now."),
+    );
+
+    const groupSummary = (() => {
       const inGroup = Boolean(state.sync.groupId);
+      const connected = hasSupabaseConfig();
+      const status = inGroup ? "Synced group" : connected ? "Ready to sync" : "Local only";
+      const title = inGroup ? (state.sync.groupName || "Your group") : "Groups";
+      const sub = inGroup
+        ? `Join code: ${state.sync.joinCode || "..."}. Invite and member tools live in ☰ Menu.`
+        : connected
+          ? "Create a group or join with a code. (Use ☰ Menu.)"
+          : "For multiple phones, connect the Supabase backend once (☰ Menu).";
 
-      const body = [];
-      body.push(h("div", { class: "itemMeta" }, "Multi-person groups need a backend. For this test build, we use Supabase (free tier) and a join code."));
-
-      body.push(
-        h("div", { class: "field" }, h("div", { class: "label" }, "Supabase URL"), urlInput),
-        h("div", { class: "field" }, h("div", { class: "label" }, "Supabase anon key"), keyInput),
+      return h(
+        "div",
+        { class: "item" },
+        h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, title), h("div", { class: "itemMeta" }, status)),
+        h("div", { class: "itemMeta" }, sub),
         h(
           "div",
           { class: "row" },
-          h(
-            "button",
-            {
-              class: "btn",
-              type: "button",
-              onClick: () => {
-                state.sync.mode = "supabase";
-                state.sync.supabaseUrl = urlInput.value.trim();
-                state.sync.supabaseAnonKey = keyInput.value.trim();
-                saveState();
-                toast("Saved", "Supabase config stored on this device.");
-                render();
-              },
-            },
-            "Save config",
-          ),
-          inGroup
-            ? h(
-                "button",
-                {
-                  class: "btn",
-                  type: "button",
-                  onClick: async () => {
-                    await cloudPullNow({ toastOnSuccess: true });
-                  },
-                },
-                "Sync now",
-              )
-            : null,
+          h("button", { class: "btn primary", type: "button", onClick: () => openGroupsModal() }, inGroup ? "Manage" : "Join / create"),
+          h("button", { class: "btn", type: "button", onClick: () => openSettingsModal() }, "Settings"),
         ),
       );
-
-      if (!connected) {
-        body.push(h("div", { class: "itemMeta" }, "Add your Supabase URL + anon key above, then create or join a group."));
-        return h("div", { class: "item" }, h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Group sync (beta)"), h("div", { class: "itemMeta" }, "Not connected")), ...body);
-      }
-
-      if (!inGroup) {
-        body.push(h("div", { class: "hr" }));
-        body.push(h("div", { class: "itemTitle" }, "Create or join"));
-        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "Your name"), yourName));
-        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "Your emoji"), yourEmoji));
-        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "New group name"), groupName));
-        body.push(
-          h(
-            "button",
-            {
-              class: "btn primary",
-              type: "button",
-              onClick: async () => {
-                const n = yourName.value.trim();
-                const e = (yourEmoji.value || "🙂").trim();
-                const gn = groupName.value.trim();
-                if (!n) return toast("Add your name", "So friends know it's you.");
-                if (!gn) return toast("Name the group", "Like 'Roomies' or 'Trip crew'.");
-                try {
-                  await cloudCreateGroup(gn, n, e);
-                } catch (err) {
-                  toast("Couldn't create group", String(err && err.message ? err.message : err));
-                }
-              },
-            },
-            "Create group",
-          ),
-        );
-        body.push(h("div", { class: "field" }, h("div", { class: "label" }, "Join code"), joinCode));
-        body.push(
-          h(
-            "button",
-            {
-              class: "btn",
-              type: "button",
-              onClick: async () => {
-                const n = yourName.value.trim();
-                const e = (yourEmoji.value || "🙂").trim();
-                const code = joinCode.value.trim().toUpperCase();
-                if (!n) return toast("Add your name", "So friends know it's you.");
-                if (!code) return toast("Add a code", "Ask your friend for the join code.");
-                try {
-                  await cloudJoinGroup(code, n, e);
-                } catch (err) {
-                  toast("Couldn't join", String(err && err.message ? err.message : err));
-                }
-              },
-            },
-            "Join group",
-          ),
-        );
-        return h("div", { class: "item" }, h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Group sync (beta)"), h("div", { class: "itemMeta" }, "Ready")), ...body);
-      }
-
-      body.push(h("div", { class: "hr" }));
-      body.push(h("div", { class: "itemTitle" }, `Group: ${state.sync.groupName || "Your group"}`));
-      body.push(h("div", { class: "itemMeta" }, `Join code: ${state.sync.joinCode || "(pull to sync)"}`));
-      body.push(
-        h(
-          "div",
-          { class: "row" },
-          h(
-            "button",
-            {
-              class: "btn",
-              type: "button",
-              onClick: async () => {
-                try {
-                  await navigator.clipboard.writeText(String(state.sync.joinCode || ""));
-                  toast("Copied", "Send that code to friends so they can join.");
-                } catch {
-                  toast("Copy didn't work", "Your browser may block clipboard access.");
-                }
-              },
-            },
-            "Copy code",
-          ),
-          h(
-            "button",
-            {
-              class: "btn ghost",
-              type: "button",
-              onClick: () => {
-                const base = defaultState();
-                const keepTheme = state.theme;
-                const keepPrefs = state.prefs;
-                const keepSync = { ...state.sync, groupId: null, groupName: null, joinCode: null, memberId: null };
-                state = { ...base, theme: keepTheme, prefs: keepPrefs, sync: keepSync };
-                saveState();
-                render();
-                toast("Left group", "You're back to local-only mode.");
-              },
-            },
-            "Leave group",
-          ),
-        ),
-      );
-      body.push(h("div", { class: "itemMeta" }, "Anyone with the join code can join this test group."));
-
-      return h("div", { class: "item" }, h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Group sync (beta)"), h("div", { class: "itemMeta" }, "Connected")), ...body);
     })();
+
+    const menuHint = h(
+      "div",
+      { class: "item" },
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Menu"), h("div", { class: "itemMeta" }, "Top right")),
+      h("div", { class: "itemMeta" }, "Groups and settings moved to the ☰ button so this tab stays simple."),
+      h("div", { class: "row" }, h("button", { class: "btn", type: "button", onClick: () => openMenuModal() }, "Open menu")),
+    );
+
+    return h("div", { class: "list" }, panel("Me", "Keep it obvious, keep it chill.", null, [groupSummary, oweCard, owedCard, mePick, menuHint]));
+  }
+
+  function openMenuModal() {
+    const content = h(
+      "div",
+      { class: "modalBody" },
+      h("div", { class: "itemMeta" }, "Everything non-essential lives here so the main tabs stay clean."),
+      h(
+        "div",
+        { class: "list" },
+        h("button", { class: "btn primary", type: "button", onClick: () => { closeModal(); openGroupsModal(); } }, "Groups"),
+        h("button", { class: "btn", type: "button", onClick: () => { closeModal(); openSettingsModal(); } }, "Settings"),
+      ),
+    );
+    openModal("Menu", content, [{ label: "Close", kind: "primary", onClick: () => closeModal() }]);
+  }
+
+  async function shareOrCopy(text, hint) {
+    const t = String(text || "");
+    if (!t) return false;
+    try {
+      if (navigator.share) {
+        await navigator.share({ text: t, title: "ChillSplit" });
+        if (hint) toast("Shared", hint);
+        return true;
+      }
+    } catch {
+      // Share sheet cancelled or unavailable. Fall back to copy.
+    }
+    try {
+      await navigator.clipboard.writeText(t);
+      toast("Copied", hint || "Paste it in Messages.");
+      return true;
+    } catch {
+      toast("Couldn't copy", "Your browser may block clipboard access.");
+      return false;
+    }
+  }
+
+  function openMessagesDraft(bodyText) {
+    const body = String(bodyText || "");
+    if (!body) return;
+    // iOS: opens Messages with a prefilled body. From there, Apple Cash is one tap away.
+    window.location.href = `sms:&body=${encodeURIComponent(body)}`;
+  }
+
+  function buildInviteLink(joinCode) {
+    const u = new URL(window.location.href);
+    u.searchParams.set("join", String(joinCode || "").trim().toUpperCase());
+    return u.toString();
+  }
+
+  function joinCodeFromUrl() {
+    try {
+      const u = new URL(window.location.href);
+      const code = u.searchParams.get("join");
+      return code ? String(code).trim().toUpperCase() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function clearJoinCodeFromUrl() {
+    try {
+      const u = new URL(window.location.href);
+      if (!u.searchParams.has("join")) return;
+      u.searchParams.delete("join");
+      const next = `${u.pathname}${u.searchParams.toString() ? `?${u.searchParams.toString()}` : ""}${u.hash || ""}`;
+      history.replaceState({}, "", next);
+    } catch {
+      // ignore
+    }
+  }
+
+  function maybePromptJoinFromLink() {
+    const code = joinCodeFromUrl();
+    if (!code) return;
+    if (state.sync.groupId) {
+      clearJoinCodeFromUrl();
+      return;
+    }
+    // Give the initial render a moment so the UI doesn't feel glitchy.
+    setTimeout(() => openGroupsModal({ prefillJoinCode: code }), 250);
+  }
+
+  function leaveGroup() {
+    const base = defaultState();
+    const keepTheme = state.theme;
+    const keepPrefs = state.prefs;
+    const keepProfile = state.profile;
+    const keepSync = {
+      ...state.sync,
+      groupId: null,
+      groupName: null,
+      joinCode: null,
+      memberId: null,
+      hostMemberId: null,
+    };
+    state = { ...base, theme: keepTheme, prefs: keepPrefs, profile: keepProfile, sync: keepSync };
+    if (!state.members.some((m) => m.id === state.prefs.meMemberId)) {
+      state.prefs.meMemberId = state.members[0]?.id || null;
+    }
+    saveState();
+    render();
+    toast("Left group", "This device is back to local-only mode.");
+  }
+
+  function openSettingsModal() {
+    const resolved = getThemeResolved();
+    const themeLabel = state.theme === "system" ? `Auto (${resolved})` : state.theme;
 
     const themeRow = h(
       "div",
@@ -1183,17 +1327,29 @@
       },
     );
 
+    const autoSyncToggle = toggleRow(
+      "Auto sync",
+      "If you're in a group, keep pulling updates in the background.",
+      Boolean(state.sync.autoSync),
+      (on) => {
+        state.sync.autoSync = on;
+        saveState();
+        ensureCloudPolling();
+        toast(on ? "Auto sync on" : "Auto sync off");
+      },
+    );
+
     const paymentsInfo = h(
       "div",
       { class: "item" },
-      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Payments (realistic check)"), h("div", { class: "itemMeta" }, "Prototype")),
-      h("div", { class: "itemMeta" }, "This web app can't read Apple Pay/Apple Cash transactions, and it doesn't move money. 'Settle' just opens Venmo/PayPal/Zelle or copies a message."),
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Apple Pay / Apple Cash"), h("div", { class: "itemMeta" }, "Reality check")),
+      h("div", { class: "itemMeta" }, "iOS does not let web apps read your Apple Pay/Apple Cash purchases. ChillSplit can suggest who should pay, then help you share a message or open Venmo/PayPal/Zelle."),
     );
 
     const reset = h(
       "div",
       { class: "item" },
-      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Demo data"), h("div", { class: "itemMeta" }, "Local only")),
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Reset this device"), h("div", { class: "itemMeta" }, "Local data")),
       h("div", { class: "itemMeta" }, "This prototype stores everything in your browser. Reset any time."),
       h(
         "div",
@@ -1204,10 +1360,17 @@
             class: "btn",
             type: "button",
             onClick: () => {
+              const keepTheme = state.theme;
+              const keepSync = state.sync;
+              const keepProfile = state.profile;
               state = defaultState();
+              state.theme = keepTheme;
+              state.sync = keepSync;
+              state.profile = keepProfile;
               saveState();
               render();
               toast("Fresh start", "Sample data restored.");
+              closeModal();
             },
           },
           "Reset",
@@ -1215,7 +1378,327 @@
       ),
     );
 
-    return h("div", { class: "list" }, panel("Me", "A little control, no fuss.", null, [mePick, groupCard, themeRow, quietToggle, roundUpToggle, paymentsInfo, reset]));
+    const content = h(
+      "div",
+      { class: "modalBody" },
+      themeRow,
+      quietToggle,
+      roundUpToggle,
+      autoSyncToggle,
+      paymentsInfo,
+      reset,
+    );
+
+    openModal("Settings", content, [{ label: "Close", kind: "primary", onClick: () => closeModal() }]);
+  }
+
+  function openGroupsModal(opts) {
+    const prefillJoin = (opts && opts.prefillJoinCode) ? String(opts.prefillJoinCode) : "";
+    const connected = hasSupabaseConfig();
+    const inGroup = Boolean(state.sync.groupId);
+    const isHost = Boolean(inGroup && state.sync.memberId && state.sync.hostMemberId && state.sync.memberId === state.sync.hostMemberId);
+
+    const myName = h("input", { id: "gsMyName", placeholder: "Your name", value: state.profile.name || "" });
+    const myEmoji = h("input", { id: "gsMyEmoji", placeholder: "Emoji", value: state.profile.emoji || "🙂" });
+
+    const backendWrap = h("div", { class: "item" });
+    const backendInner = [];
+
+    const urlInput = h("input", { id: "sbUrl", placeholder: "Supabase Project URL", value: String(state.sync.supabaseUrl || "") });
+    const keyInput = h("input", { id: "sbKey", placeholder: "Supabase anon public key", value: String(state.sync.supabaseAnonKey || "") });
+
+    const advancedBody = h(
+      "div",
+      { class: "list", id: "backendAdvanced", style: connected ? "display:none;" : "" },
+      h("div", { class: "field" }, h("div", { class: "label" }, "Supabase URL"), urlInput),
+      h("div", { class: "field" }, h("div", { class: "label" }, "Supabase anon key"), keyInput),
+      h(
+        "div",
+        { class: "row" },
+        h(
+          "button",
+          {
+            class: "btn",
+            type: "button",
+            onClick: () => {
+              state.sync.mode = "supabase";
+              state.sync.supabaseUrl = urlInput.value.trim();
+              state.sync.supabaseAnonKey = keyInput.value.trim();
+              saveState();
+              toast("Saved", "Backend config stored on this device.");
+              closeModal();
+              openGroupsModal({ prefillJoinCode: prefillJoin });
+            },
+          },
+          "Save backend",
+        ),
+      ),
+    );
+
+    const advToggle = h(
+      "button",
+      {
+        class: "btn ghost",
+        type: "button",
+        onClick: () => {
+          const el = advancedBody;
+          const open = el.style.display !== "none";
+          el.style.display = open ? "none" : "";
+        },
+      },
+      connected ? "Edit backend" : "Backend settings",
+    );
+
+    backendInner.push(
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Backend"), h("div", { class: "itemMeta" }, connected ? "Connected" : "Not set")),
+      h("div", { class: "itemMeta" }, connected ? "Good to go. Your join code is what friends need." : "For multi-phone groups, we use Supabase (free tier)."),
+      h("div", { class: "row" }, advToggle),
+      advancedBody,
+    );
+    backendWrap.replaceChildren(...backendInner);
+
+    const profileWrap = h(
+      "div",
+      { class: "item" },
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Your profile"), h("div", { class: "itemMeta" }, "Shown to friends")),
+      h("div", { class: "field" }, h("div", { class: "label" }, "Name"), myName),
+      h("div", { class: "field" }, h("div", { class: "label" }, "Emoji"), myEmoji),
+    );
+    if (inGroup && state.sync.memberId && connected) {
+      profileWrap.append(
+        h(
+          "div",
+          { class: "row" },
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              onClick: async () => {
+                const n = myName.value.trim();
+                const e = (myEmoji.value || "🙂").trim();
+                if (!n) return toast("Add a name", "So friends know it's you.");
+                try {
+                  const sb = await getSupabaseClient();
+                  const up = await sb
+                    .from("cs_members")
+                    .update({ name: n, emoji: e || "🙂" })
+                    .eq("group_id", state.sync.groupId)
+                    .eq("id", state.sync.memberId);
+                  if (up.error) throw up.error;
+                  state.profile.name = n;
+                  state.profile.emoji = e || "🙂";
+                  saveState();
+                  await cloudPullNow();
+                  toast("Updated", "Profile saved to the group.");
+                } catch (err) {
+                  toast("Couldn't update profile", String(err && err.message ? err.message : err));
+                }
+              },
+            },
+            "Save profile",
+          ),
+        ),
+      );
+    }
+
+    const sections = [backendWrap, profileWrap];
+
+    if (!connected) {
+      sections.push(h("div", { class: "item" }, h("div", { class: "itemTitle" }, "Next"), h("div", { class: "itemMeta" }, "Set the backend above, then come back here to create or join a group.")));
+      const content = h("div", { class: "modalBody" }, ...sections);
+      return openModal("Groups", content, [{ label: "Close", kind: "primary", onClick: () => closeModal() }]);
+    }
+
+    if (!inGroup) {
+      const groupName = h("input", { id: "gsGroupName", placeholder: "Group name (Roomies, Trip Crew...)", value: "" });
+      const joinCode = h("input", { id: "gsJoinCode", placeholder: "Join code", value: prefillJoin.toUpperCase() });
+
+      const joinWrap = h(
+        "div",
+        { class: "item" },
+        h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Join a group"), h("div", { class: "itemMeta" }, "Fast")),
+        h("div", { class: "field" }, h("div", { class: "label" }, "Code"), joinCode),
+        h(
+          "div",
+          { class: "row" },
+          h(
+            "button",
+            {
+              class: "btn primary",
+              type: "button",
+              onClick: async (ev) => {
+                const btn = ev.currentTarget;
+                if (btn && btn.getAttribute("data-busy") === "true") return;
+                const n = myName.value.trim();
+                const e = (myEmoji.value || "🙂").trim();
+                const code = joinCode.value.trim().toUpperCase();
+                if (!n) return toast("Add your name", "So friends know it's you.");
+                if (!code) return toast("Add a code", "Ask your friend for the join code.");
+                if (btn) {
+                  btn.setAttribute("data-busy", "true");
+                  btn.disabled = true;
+                  btn.textContent = "Joining...";
+                }
+                try {
+                  state.profile.name = n;
+                  state.profile.emoji = e || "🙂";
+                  state.sync.mode = "supabase";
+                  saveState();
+                  await cloudJoinGroup(code, n, e);
+                  clearJoinCodeFromUrl();
+                  closeModal();
+                } catch (err) {
+                  toast("Couldn't join", String(err && err.message ? err.message : err));
+                } finally {
+                  if (btn) {
+                    btn.disabled = false;
+                    btn.setAttribute("data-busy", "false");
+                    btn.textContent = "Join";
+                  }
+                }
+              },
+            },
+            "Join",
+          ),
+        ),
+      );
+
+      const createWrap = h(
+        "div",
+        { class: "item" },
+        h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, "Create a group"), h("div", { class: "itemMeta" }, "New")),
+        h("div", { class: "field" }, h("div", { class: "label" }, "Group name"), groupName),
+        h(
+          "div",
+          { class: "row" },
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              onClick: async (ev) => {
+                const btn = ev.currentTarget;
+                if (btn && btn.getAttribute("data-busy") === "true") return;
+                const n = myName.value.trim();
+                const e = (myEmoji.value || "🙂").trim();
+                const gn = groupName.value.trim();
+                if (!n) return toast("Add your name", "So friends know it's you.");
+                if (!gn) return toast("Name the group", "Like 'Roomies' or 'Trip crew'.");
+                if (btn) {
+                  btn.setAttribute("data-busy", "true");
+                  btn.disabled = true;
+                  btn.textContent = "Creating...";
+                }
+                try {
+                  state.profile.name = n;
+                  state.profile.emoji = e || "🙂";
+                  state.sync.mode = "supabase";
+                  saveState();
+                  await cloudCreateGroup(gn, n, e);
+                  closeModal();
+                } catch (err) {
+                  toast("Couldn't create group", String(err && err.message ? err.message : err));
+                } finally {
+                  if (btn) {
+                    btn.disabled = false;
+                    btn.setAttribute("data-busy", "false");
+                    btn.textContent = "Create";
+                  }
+                }
+              },
+            },
+            "Create",
+          ),
+        ),
+      );
+
+      sections.push(joinWrap, createWrap);
+      const content = h("div", { class: "modalBody" }, ...sections);
+      return openModal("Groups", content, [{ label: "Close", kind: "primary", onClick: () => closeModal() }]);
+    }
+
+    const invite = buildInviteLink(state.sync.joinCode || "");
+
+    const membersList = h(
+      "div",
+      { class: "list" },
+      ...state.members.map((m) => {
+        const right = m.id === state.sync.hostMemberId
+          ? h("span", { class: "badge good" }, "Host")
+          : (isHost && m.id !== state.sync.memberId)
+            ? h(
+                "button",
+                {
+                  class: "btn ghost",
+                  type: "button",
+                  onClick: async () => {
+                    await cloudRemoveMember(m.id);
+                  },
+                },
+                "Remove",
+              )
+            : h("span", { class: "itemMeta" }, "");
+
+        return h(
+          "div",
+          { class: "row" },
+          h("div", null, h("span", { class: "itemTitle" }, `${m.emoji} ${m.name}`)),
+          right,
+        );
+      }),
+    );
+
+    const groupWrap = h(
+      "div",
+      { class: "item" },
+      h("div", { class: "itemTop" }, h("div", { class: "itemTitle" }, state.sync.groupName || "Your group"), h("div", { class: "itemMeta" }, "Connected")),
+      h("div", { class: "itemMeta" }, `Join code: ${state.sync.joinCode || "..."}`),
+      h(
+        "div",
+        { class: "row" },
+        h("button", { class: "btn primary", type: "button", onClick: () => shareOrCopy(invite, "Invite link ready.") }, "Share invite"),
+        h("button", { class: "btn", type: "button", onClick: () => shareOrCopy(String(state.sync.joinCode || ""), "Code copied.") }, "Copy code"),
+        h("button", { class: "btn", type: "button", onClick: async () => { await cloudPullNow({ toastOnSuccess: true }); } }, "Sync now"),
+      ),
+      h("div", { class: "hr" }),
+      h("div", { class: "itemTitle" }, "Members"),
+      membersList,
+      h(
+        "div",
+        { class: "row" },
+        h("button", { class: "btn ghost", type: "button", onClick: () => { closeModal(); leaveGroup(); } }, "Leave group"),
+      ),
+      h("div", { class: "itemMeta" }, isHost ? "You're the host on this device (you can remove duplicates)." : "Ask the host to remove duplicates if they happen."),
+    );
+
+    sections.push(groupWrap);
+    const content = h("div", { class: "modalBody" }, ...sections);
+    return openModal("Groups", content, [{ label: "Close", kind: "primary", onClick: () => closeModal() }]);
+  }
+
+  async function cloudRemoveMember(memberId) {
+    if (!isCloudEnabled()) return;
+    if (!state.sync.hostMemberId || state.sync.memberId !== state.sync.hostMemberId) {
+      return toast("Only the host can remove members", "For now (prototype rule).");
+    }
+    if (memberId === state.sync.memberId) return toast("Can't remove yourself", "Use Leave group instead.");
+
+    try {
+      const sb = await getSupabaseClient();
+      const groupId = state.sync.groupId;
+      // Best-effort cleanup. If the member has expenses, FK constraints might block deletion.
+      await sb.from("cs_pool_contributions").delete().eq("member_id", memberId);
+      await sb.from("cs_comments").delete().eq("group_id", groupId).eq("by_member_id", memberId);
+      const del = await sb.from("cs_members").delete().eq("group_id", groupId).eq("id", memberId);
+      if (del.error) throw del.error;
+      toast("Removed", "Member removed from the group.");
+      await cloudPullNow();
+      closeModal();
+      openGroupsModal();
+    } catch (e) {
+      toast("Couldn't remove", String(e && e.message ? e.message : e));
+    }
   }
 
   function toggleRow(title, subtitle, initialOn, onChange) {
@@ -1676,6 +2159,37 @@
     ]);
   }
 
+  async function cloudEnsurePool(month, perPersonCents) {
+    const sb = await getSupabaseClient();
+    const groupId = state.sync.groupId;
+    if (!groupId) throw new Error("Missing group");
+
+    // Avoid relying on unique constraints for prototypes: pick the newest pool row for the month.
+    const existing = await sb
+      .from("cs_pools")
+      .select("id")
+      .eq("group_id", groupId)
+      .eq("month", month)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (existing.error) throw existing.error;
+
+    const poolId = existing.data && existing.data[0] ? existing.data[0].id : null;
+    if (poolId) {
+      const up = await sb.from("cs_pools").update({ per_person_cents: Number(perPersonCents || 0) }).eq("id", poolId);
+      if (up.error) throw up.error;
+      return poolId;
+    }
+
+    const ins = await sb
+      .from("cs_pools")
+      .insert({ group_id: groupId, month, per_person_cents: Number(perPersonCents || 0) })
+      .select("id")
+      .single();
+    if (ins.error) throw ins.error;
+    return ins.data.id;
+  }
+
   function openPoolModal(homeId, month) {
     const key = `${homeId}:${month}`;
     const pool = state.pools[key] || { month, perPersonCents: 0, contributions: {}, deductions: [] };
@@ -1721,18 +2235,19 @@
           if (isCloudEnabled()) {
             try {
               const sb = await getSupabaseClient();
-              const up = await sb
-                .from("cs_pools")
-                .upsert({ group_id: state.sync.groupId, month, per_person_cents: perCents }, { onConflict: "group_id,month" })
-                .select("id")
-                .single();
-              if (up.error) throw up.error;
-              const poolId = up.data.id;
-              for (const [mid, cents] of Object.entries(next.contributions)) {
-                const res = await sb
-                  .from("cs_pool_contributions")
-                  .upsert({ pool_id: poolId, member_id: mid, amount_cents: Number(cents || 0) }, { onConflict: "pool_id,member_id" });
-                if (res.error) throw res.error;
+              const poolId = await cloudEnsurePool(month, perCents);
+
+              // Replace contributions in one go (simple + avoids unique constraints during prototyping).
+              const delOld = await sb.from("cs_pool_contributions").delete().eq("pool_id", poolId);
+              if (delOld.error) throw delOld.error;
+              const rows = Object.entries(next.contributions || {}).map(([mid, cents]) => ({
+                pool_id: poolId,
+                member_id: mid,
+                amount_cents: Number(cents || 0),
+              }));
+              if (rows.length) {
+                const ins = await sb.from("cs_pool_contributions").insert(rows);
+                if (ins.error) throw ins.error;
               }
               closeModal();
               await cloudPullNow();
@@ -1777,15 +2292,10 @@
           if (isCloudEnabled()) {
             try {
               const sb = await getSupabaseClient();
-              const up = await sb
-                .from("cs_pools")
-                .upsert({ group_id: state.sync.groupId, month, per_person_cents: Number(pool.perPersonCents || 0) }, { onConflict: "group_id,month" })
-                .select("id")
-                .single();
-              if (up.error) throw up.error;
+              const poolId = await cloudEnsurePool(month, Number(pool.perPersonCents || 0));
               const ins = await sb
                 .from("cs_pool_deductions")
-                .insert({ pool_id: up.data.id, title, emoji, amount_cents: amountCents, at: new Date().toISOString() });
+                .insert({ pool_id: poolId, title, emoji, amount_cents: amountCents, at: new Date().toISOString() });
               if (ins.error) throw ins.error;
               closeModal();
               await cloudPullNow();
@@ -2356,15 +2866,19 @@
               class: "btn",
               type: "button",
               onClick: async () => {
-                try {
-                  await navigator.clipboard.writeText(`${message}\n${note}`);
-                  toast("Copied", "Paste it in chat or your payment app.");
-                } catch {
-                  toast("Copy didn't work", "Your browser may block clipboard access.");
-                }
+                await shareOrCopy(`${message}\n${note}`, "Ready to send.");
               },
             },
-            "Copy",
+            "Share",
+          ),
+          h(
+            "button",
+            {
+              class: "btn ghost",
+              type: "button",
+              onClick: () => openMessagesDraft(`${message}\n${note}`),
+            },
+            "Messages",
           ),
         ),
       ),
@@ -2408,15 +2922,19 @@
               class: "btn",
               type: "button",
               onClick: async () => {
-                try {
-                  await navigator.clipboard.writeText(note);
-                  toast("Copied", "Paste it in Venmo/PayPal/Zelle.");
-                } catch {
-                  toast("Copy didn't work", "Your browser may block clipboard access.");
-                }
+                await shareOrCopy(note, "Ready to paste.");
               },
             },
-            "Copy",
+            "Share",
+          ),
+          h(
+            "button",
+            {
+              class: "btn ghost",
+              type: "button",
+              onClick: () => openMessagesDraft(note),
+            },
+            "Messages",
           ),
         ),
       ),
@@ -2450,7 +2968,15 @@
     toast("Opened", "Use any method you like.");
   }
 
+  let modalPrevBodyOverflow = null;
+
   function openModal(title, bodyEl, actions) {
+    // Prevent the background page from stealing scroll (especially on iOS).
+    if (modalPrevBodyOverflow == null) {
+      modalPrevBodyOverflow = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+    }
+
     elModalHost.innerHTML = "";
     elModalHost.setAttribute("data-open", "true");
     elModalHost.setAttribute("aria-hidden", "false");
@@ -2488,6 +3014,10 @@
   function closeModal() {
     elModalHost.setAttribute("data-open", "false");
     elModalHost.setAttribute("aria-hidden", "true");
+    if (modalPrevBodyOverflow != null) {
+      document.body.style.overflow = modalPrevBodyOverflow;
+      modalPrevBodyOverflow = null;
+    }
     // Allow exit transition.
     setTimeout(() => (elModalHost.innerHTML = ""), 180);
   }
@@ -2538,6 +3068,7 @@
   }
 
   elQuickAddBtn?.addEventListener("click", () => openQuickAddModal());
+  elMenuBtn?.addEventListener("click", () => openMenuModal());
 
   elThemeBtn.addEventListener("click", () => {
     const next = state.theme === "system" ? "light" : state.theme === "light" ? "dark" : "system";
@@ -2555,13 +3086,12 @@
   applyTheme();
   render();
 
-  // If cloud sync is configured, pull once on boot and then poll occasionally (simple, works everywhere).
-  if (isCloudEnabled()) {
-    cloudPullNow();
-    setInterval(() => {
-      if (state.sync.autoSync && isCloudEnabled()) cloudPullNow();
-    }, 8000);
-  }
+  // Cloud: start a lightweight poller (it only does work when you're in a group).
+  ensureCloudPolling();
+  if (isCloudEnabled()) cloudPullNow();
+
+  // If a friend opens an invite link like `...?join=ABCD1234`, prefill Groups.
+  maybePromptJoinFromLink();
 
   // PWA: best-effort service worker registration (works on https/localhost).
   if ("serviceWorker" in navigator) {

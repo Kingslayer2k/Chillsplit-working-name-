@@ -1,5 +1,5 @@
 /* Simple offline shell cache for the ChillSplit PWA prototype. */
-const CACHE_NAME = "chillsplit-shell-v3";
+const CACHE_NAME = "chillsplit-shell-v4";
 const ASSETS = [
   "./",
   "./index.html",
